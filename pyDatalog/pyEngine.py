@@ -18,6 +18,8 @@ License along with this library; if not, write to the Free Software
 Foundation, Inc.  51 Franklin St, Fifth Floor, Boston, MA 02110-1301
 USA
 """
+# import similarity
+import similarity
 
 """
 This file contains the port of the datalog engine of J. D. Ramsdell, 
@@ -38,10 +40,12 @@ from . import util
 Logging = False # True --> Logging is activated.  Kept for performance reason
 
 Auto_print = False # True => automatically prints the result of a query
-Slow_motion = False # True => detail print of the stack of tasks at each step
+Slow_motion = True # True => detail print of the stack of tasks at each step
 
 Python_resolvers = {} # dictionary  of python functions that can resolve a predicate
 Logic = None # place holder for Logic class from Logic module
+SCORE = '__SCORE__'
+LAMBDA = 0.1
 
 # Keep a dictionary of classes with datalog capabilities.  
 Class_dict = {}
@@ -151,6 +155,9 @@ class Const(Term):
     def unify(self, term, env):
         if isinstance(term, Fresh_var):
             env[term.id] = self
+            return env
+        elif term.is_const():
+            env[SCORE] = similarity.tnorm(similarity.entity_similarity(self.id, term.id), env[SCORE])
             return env
         return None
 
@@ -393,11 +400,12 @@ class Literal(object):
     """ A literal is a predicate and a sequence of terms, 
         the number of which must match the predicate's arity.
     """
-    __slots__ = ['terms', 'pred', 'id', 'tag', 'aggregate']
+    __slots__ = ['terms', 'pred', 'id', 'tag', 'aggregate', 'score']
     def __init__(self, pred, terms, prearity=None, aggregate=None):
         self.terms = terms
         self.aggregate = aggregate
         self.id, self.tag = None, None
+        self.score = 1.0
         if isinstance(pred, util.string_types):
             self.pred = Pred(pred, len(terms))
             self.pred.prearity = len(terms) if prearity is None else prearity
@@ -474,8 +482,13 @@ class Literal(object):
         return Literal(self.pred, result, aggregate=self.aggregate)
 
     def unify(self, other): #unify
-        if self.pred != other.pred: return None
-        env = {}
+        if self.pred == other.pred:
+            sim = 1
+        else:
+            sim = similarity.predicate_similarity(self.pred.name, other.pred.name)
+        if sim < Logic.tl.logic.threshold:
+            return None
+        env = {SCORE: sim}
         for term, otherterm in zip(self.terms, other.terms):
             literal_i = term if isinstance(term, Const) else term.chase(env)
             other_i = otherterm if isinstance(otherterm, Const) else otherterm.chase(env)
@@ -486,7 +499,7 @@ class Literal(object):
         while todo:
             todo = False
             for key, value in env.items(): # 2nd pass for issue #14
-                if not isinstance(value, Const):
+                if not isinstance(value, Const) and hasattr(value, 'chase'):
                     new_value = value.chase(env)
                     if env[key].id != new_value.id:
                         env[key]= new_value
@@ -523,12 +536,13 @@ class Clause(object):
     """ A clause asserts that its head is true if every literal in its body is
         true.  If there are no literals in the body, the clause is a fact
     """
-    __slots__ = ['head', 'body', 'id']
+    __slots__ = ['head', 'body', 'id', 'score']
 
     def __init__(self, head, body):
         self.head = head
         self.body = body
         self.id = None
+        self.score = 1.0
     def __str__(self):  
         return "%s <= %s" % (str(self.head), '&'.join(str(literal) for literal in self.body))
     def __repr__(self):  
@@ -591,7 +605,7 @@ def remove(pred):
     if pred.id in Logic.tl.logic.Db: 
         del Logic.tl.logic.Db[pred.id]
     return pred
-    
+
 def assert_(clause):
     """ Add a safe clause to the database """
     pred = clause.head.pred
@@ -633,19 +647,19 @@ def retract(clause):
 def relevant_clauses(literal):
     """ returns matching clauses for a literal query, using index """
     result = None
-    for i, term in enumerate(literal.terms):
-        if term.is_const():
-            facts = literal.pred.index[i].get(term.id, set()) # default : a set
-            result = facts if result is None else result.intersection(facts)
-    if result is None: # no constants found in literal, thus could not filter literal.pred.deb
-        for v in literal.pred.db.values(): 
+    if literal.pred.name.startswith('_pyD_query'):
+        for v in literal.pred.db.values():
             yield v
     else:
-        for v in literal.pred.clauses.values(): 
-            yield v
-        for v in result: 
-            yield v
-    
+        for pred in Logic.tl.logic.Db.values():
+            if not pred.name.startswith('_pyD_query'):
+                for v in pred.db.values():
+                    yield v
+            # if pred.prearity is None:
+            #     continue
+            #
+            # else:
+
 ################# Subgoals ###############################
 
 """
@@ -667,7 +681,7 @@ class Subgoal(object):
     A subgoal has a literal, a set of facts, and an array of waiters.
     A waiter is a pair containing a subgoal and a clause.
     """
-    __slots__ = ['literal', 'facts', 'waiters', 'tasks', 'clauses', 'recursive', 'is_done', 'on_completion_']
+    __slots__ = ['literal', 'facts', 'waiters', 'tasks', 'clauses', 'recursive', 'is_done', 'on_completion_', 'score']
     def __init__(self, literal):
         self.literal = literal
         self.facts = {}
@@ -679,6 +693,7 @@ class Subgoal(object):
         # or when one fact is found for a function of constants
         self.is_done = False
         self.on_completion_ = []
+        self.score = 1.0
     
     def __repr__(self):
         return str(self.literal)
@@ -749,13 +764,14 @@ class Subgoal(object):
                 base_literal = Literal(literal.pred.name, base_terms) # without aggregate to avoid infinite loop
                 self.complete(base_literal, literal.aggregate)
                 return self.next_step()
-            elif literal.pred.id in Logic.tl.logic.Db: # has a datalog definition, e.g. p(X), p[X]==Y
+            elif literal.pred.id in Logic.tl.logic.Db or literal.pred.prearity is not None: # has a datalog definition, e.g. p(X), p[X]==Y
                 assert self.clauses == []
                 for clause in relevant_clauses(literal):
                     renamed = clause.rename()
                     env = literal.unify(renamed.head)
                     if env != None:
                         clause = renamed.subst(env, class0)
+                        clause.score = similarity.tnorm(env[SCORE], literal.score)
                         if Logging and Logger.isEnabledFor(logging.DEBUG):
                             Logger.debug("pyDatalog will use clause : %s" % clause)
                         self.clauses.append((ADD_CLAUSE, (self, clause)))
@@ -845,7 +861,7 @@ class Subgoal(object):
                     resolvent = Clause(clause.head, clause.body[1:])
                     subgoal.schedule((ADD_CLAUSE, (subgoal, resolvent)))
                 self.waiters = []
-        elif self.facts is not True:
+        elif self.facts is not True: # subgoal.facts is True if subgoal has been proved
             fact_id = literal.get_fact_id()
             if not self.facts.get(fact_id):
                 self.facts[fact_id] = literal
@@ -859,6 +875,7 @@ class Subgoal(object):
                     assert env != None
                     resolvent = Clause(clause.head.subst(env), 
                                        [bodi.subst(env) for bodi in clause.body[1:] ])
+                    resolvent.score = similarity.tnorm(env[SCORE], literal.score)
                     subgoal.schedule((ADD_CLAUSE, (subgoal, resolvent)))
                 if len(self.facts)==1:  # stop if one fact for a function of constant
                     all_const = True # Cython equivalent for all(self.literal.terms[i].is_const() for i in range(self.literal.pred.prearity)
@@ -868,9 +885,12 @@ class Subgoal(object):
                             all_const = False
                             break
                     if all_const:
-                        if Slow_motion: print("is done !")
                         self.is_done = True
+                        self.score = literal.score
+                        if Slow_motion: print("is done w/ score " + str(self.score))
                         self.waiters = []
+            else:
+                self.facts.get(fact_id).score = max(self.facts.get(fact_id).score, literal.score)
 
     def fact_candidate(self, class0, result):
         """ add result as a candidate fact of class0 for subgoal"""
@@ -905,6 +925,7 @@ class Subgoal(object):
                 sg.waiters.append((self, clause)) # add me to sg's waiters
         else: # new subgoal --> create it and launch it
             sg = Subgoal(selected)
+            sg.score = self.score
             sg.waiters.append((self, clause))
             self.schedule_search(sg)
             
@@ -1162,6 +1183,7 @@ def clear():
     Logic.tl.logic.Recursive = False
     Logic.tl.logic.Goal = None
     Logic.tl.logic.gc_uncollected = False
+    Logic.tl.logic.threshold = LAMBDA
     Fresh_var.tl.counter = 0
 
     insert(Pred("==", 2)).prim = equals_primitive
